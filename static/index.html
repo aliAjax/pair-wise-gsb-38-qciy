@@ -6,6 +6,15 @@
 <div class="card"><h2>录入字幕</h2><textarea id="cue" rows="5">{"cue_index":1,"start_ms":1000,"end_ms":3000,"text":"海豹出现在冰面上","expected_revision":0}</textarea><button onclick="saveCue()">保存字幕</button><pre id="cueResult"></pre></div>
 <div class="card"><h2>时间点评论</h2><input id="time" type="number" value="1200"><input id="comment" value="请复核这里的术语"><button onclick="addComment()">添加评论</button><pre id="commentResult"></pre></div>
 <div class="card"><h2>状态流转</h2><button onclick="action('submit')">提交复核</button><button onclick="review('approve')">复核通过</button><button onclick="review('reject')">退回修改</button><button onclick="action('lock')">锁定</button><button onclick="action('deliver')">交付</button><pre id="stateResult"></pre></div>
+<div class="card"><h2>离线批次合并</h2><p>剪辑车回网批次带 <code>batch_uid</code>、<code>baseline_revision</code> 和操作日志。上传只生成合并差异与待处理清单，不改主版本；重复上传同一批次只结算一次。</p>
+<textarea id="batch" rows="6">{"batch_uid":"truck-1","baseline_revision":0,"operations":[{"op":"upsert","cue_id":1,"base":{"cue_index":1,"start_ms":1000,"end_ms":3000,"text":"海豹出现在冰面上"},"cue_index":1,"start_ms":1000,"end_ms":2500,"text":"海豹出现在冰面"}]}</textarea>
+<button onclick="uploadMerge()">上传批次</button><button onclick="loadMerges()">查看本版本批次</button><pre id="mergeResult"></pre>
+<label>批次 ID <input id="batchId" type="number" value="1"></label><button onclick="loadMerge()">查看差异（任何成员可读）</button>
+<div>待处理项 ID <input id="itemId" type="number" style="width:90px">
+<select id="decision"><option value="main">保留主版本 main</option><option value="offline">采用离线 offline</option><option value="custom">自定义 custom</option></select>
+<input id="resolutionText" placeholder='custom 文本：{"text":"海豹"} 或 {"end_ms":2600}' style="width:340px">
+<button onclick="resolveItem()">裁决（仅负责人）</button></div>
+<button onclick="confirmMerge()">负责人确认并原子入库</button><pre id="mergeDetail"></pre></div>
 <script>
 const auth=()=>({'Content-Type':'application/json','X-User':user.value,'X-Role':role.value});
 async function call(url,opts={}){const r=await fetch(url,opts);const j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}
@@ -14,4 +23,9 @@ async function addComment(){try{commentResult.textContent=JSON.stringify(await c
 async function action(name){try{stateResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/'+name,{method:'POST',headers:auth(),body:'{}'}),null,2);refresh()}catch(e){stateResult.textContent=e.message}}
 async function review(decision){try{stateResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/review',{method:'POST',headers:auth(),body:JSON.stringify({decision,comment:''})}),null,2);refresh()}catch(e){stateResult.textContent=e.message}}
 async function refresh(){try{const [p,v,c,cm,d]=await Promise.all(['/api/projects','/api/versions','/api/versions/'+version.value+'/cues','/api/versions/'+version.value+'/comments','/api/deliveries'].map(call));data.textContent=JSON.stringify({p,v,c,cm,d},null,2)}catch(e){data.textContent=e.message}}
+async function uploadMerge(){try{mergeResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/merges',{method:'POST',headers:auth(),body:batch.value}),null,2)}catch(e){mergeResult.textContent=e.message}}
+async function loadMerges(){try{mergeResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/merges'),null,2)}catch(e){mergeResult.textContent=e.message}}
+async function loadMerge(){try{mergeDetail.textContent=JSON.stringify(await call('/api/merges/'+batchId.value),null,2)}catch(e){mergeDetail.textContent=e.message}}
+async function resolveItem(){const extra=resolutionText.value?JSON.parse(resolutionText.value):{};try{mergeDetail.textContent=JSON.stringify(await call('/api/merge-items/'+itemId.value+'/resolve',{method:'POST',headers:auth(),body:JSON.stringify({decision:decision.value,...extra})}),null,2);loadMerge()}catch(e){mergeDetail.textContent=e.message}}
+async function confirmMerge(){try{mergeDetail.textContent=JSON.stringify(await call('/api/merges/'+batchId.value+'/confirm',{method:'POST',headers:auth(),body:'{}'}),null,2);refresh()}catch(e){mergeDetail.textContent=e.message}}
 </script></body></html>
