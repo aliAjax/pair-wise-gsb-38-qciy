@@ -6,6 +6,7 @@
 <div class="card"><h2>录入字幕</h2><textarea id="cue" rows="5">{"cue_index":1,"start_ms":1000,"end_ms":3000,"text":"海豹出现在冰面上","expected_revision":0}</textarea><button onclick="saveCue()">保存字幕</button><pre id="cueResult"></pre></div>
 <div class="card"><h2>时间点评论</h2><input id="time" type="number" value="1200"><input id="comment" value="请复核这里的术语"><button onclick="addComment()">添加评论</button><pre id="commentResult"></pre></div>
 <div class="card"><h2>状态流转</h2><button onclick="action('submit')">提交复核</button><button onclick="review('approve')">复核通过</button><button onclick="review('reject')">退回修改</button><button onclick="action('lock')">锁定</button><button onclick="action('deliver')">交付</button><pre id="stateResult"></pre></div>
+<div class="card"><h2>离线批次回网合并</h2><textarea id="batch" rows="5">{"baseline_revision":1,"operations":[{"op":"update","ref":1,"start_ms":1000,"end_ms":2500}]}</textarea><button onclick="uploadBatch()">上传批次</button><button onclick="listBatches()">查看批次</button><label>批次 ID <input id="batchId" type="number" value="1"></label><button onclick="confirmBatch()">负责人确认</button><button onclick="retryBatch()">重试失败批次</button><pre id="batchResult"></pre></div>
 <script>
 const auth=()=>({'Content-Type':'application/json','X-User':user.value,'X-Role':role.value});
 async function call(url,opts={}){const r=await fetch(url,opts);const j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}
@@ -14,4 +15,8 @@ async function addComment(){try{commentResult.textContent=JSON.stringify(await c
 async function action(name){try{stateResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/'+name,{method:'POST',headers:auth(),body:'{}'}),null,2);refresh()}catch(e){stateResult.textContent=e.message}}
 async function review(decision){try{stateResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/review',{method:'POST',headers:auth(),body:JSON.stringify({decision,comment:''})}),null,2);refresh()}catch(e){stateResult.textContent=e.message}}
 async function refresh(){try{const [p,v,c,cm,d]=await Promise.all(['/api/projects','/api/versions','/api/versions/'+version.value+'/cues','/api/versions/'+version.value+'/comments','/api/deliveries'].map(call));data.textContent=JSON.stringify({p,v,c,cm,d},null,2)}catch(e){data.textContent=e.message}}
+async function uploadBatch(){try{batchResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/offline-batches',{method:'POST',headers:auth(),body:batch.value}),null,2)}catch(e){batchResult.textContent=e.message}}
+async function listBatches(){try{batchResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/offline-batches',{headers:auth()}),null,2)}catch(e){batchResult.textContent=e.message}}
+async function confirmBatch(){try{batchResult.textContent=JSON.stringify(await call('/api/offline-batches/'+batchId.value+'/confirm',{method:'POST',headers:auth(),body:'{}'}),null,2);refresh()}catch(e){batchResult.textContent=e.message}}
+async function retryBatch(){try{batchResult.textContent=JSON.stringify(await call('/api/offline-batches/'+batchId.value+'/retry',{method:'POST',headers:auth(),body:'{}'}),null,2)}catch(e){batchResult.textContent=e.message}}
 </script></body></html>

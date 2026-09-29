@@ -131,6 +131,21 @@ class Database:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS offline_batches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+                    baseline_revision INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    content_hash TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    merge_result TEXT NOT NULL DEFAULT '{}',
+                    error TEXT NOT NULL DEFAULT '',
+                    uploaded_by TEXT NOT NULL,
+                    confirmed_by TEXT,
+                    created_at TEXT NOT NULL,
+                    confirmed_at TEXT,
+                    UNIQUE(version_id,content_hash)
+                );
                 """
             )
 
@@ -383,6 +398,421 @@ class Database:
             self._audit(conn, actor, "version.delivered", "version", version_id, {"snapshot_hash": snapshot_hash})
         return dict(conn.execute("SELECT * FROM deliveries WHERE id=?", (cur.lastrowid,)).fetchone())
 
+    # ------------------------------------------------------------------
+    # Offline batch merge (three-way: baseline x offline log x main)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _batch_hash(version_id: int, payload: dict[str, Any]) -> str:
+        canonical = json.dumps(
+            {"version_id": version_id, "baseline_revision": payload.get("baseline_revision"),
+             "operations": payload.get("operations"), "baseline_cues": payload.get("baseline_cues")},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    def _check_batch_access(self, conn: sqlite3.Connection, version: sqlite3.Row, actor: str,
+                            role: str, require_owner: bool = False) -> None:
+        if actor != version["owner"] and role != "admin":
+            if require_owner:
+                raise DomainError("只有项目负责人可以确认离线批次", 403)
+            if not conn.execute("SELECT 1 FROM assignments WHERE version_id=? AND user=?", (version["id"], actor)).fetchone():
+                raise DomainError("只有项目成员可以查看离线批次", 403)
+
+    def _check_upload_batch(self, conn: sqlite3.Connection, version: sqlite3.Row, actor: str, role: str) -> None:
+        if actor == version["owner"] or role == "admin":
+            return
+        if conn.execute("SELECT 1 FROM assignments WHERE version_id=? AND user=? AND role IN ('translator','timeline')",
+                        (version["id"], actor)).fetchone():
+            return
+        raise DomainError("没有该版本的离线回网权限", 403)
+
+    @staticmethod
+    def _cue_fields_from_op(op: dict[str, Any], ci: int, require_full: bool) -> dict[str, Any]:
+        fields: dict[str, Any] = {}
+        fields["cue_index"] = int(op["cue_index"]) if "cue_index" in op else ci
+        for key in ("start_ms", "end_ms"):
+            if key in op:
+                fields[key] = int(op[key])
+            elif require_full:
+                raise DomainError(f"新增字幕缺少 {key}")
+        if "text" in op:
+            fields["text"] = str(op["text"]).strip()
+        elif require_full:
+            raise DomainError("新增字幕缺少 text")
+        if require_full and (fields["start_ms"] < 0 or fields["end_ms"] <= fields["start_ms"] or not fields["text"]):
+            raise DomainError("新增字幕时间或内容不合法")
+        return fields
+
+    @staticmethod
+    def _same_cue(row: sqlite3.Row, cue: dict[str, Any]) -> bool:
+        return (int(row["cue_index"]) == int(cue["cue_index"]) and int(row["start_ms"]) == int(cue["start_ms"])
+                and int(row["end_ms"]) == int(cue["end_ms"]) and row["text"] == cue["text"])
+
+    def _compute_merge(self, conn: sqlite3.Connection, version: sqlite3.Row,
+                       payload: dict[str, Any]) -> tuple[dict[Any, Any], list[dict[str, Any]], dict[str, list[int]]]:
+        """Three-way merge. Returns (merged keyed by identity, conflicts, actions).
+
+        Identity is ("b", cue_index) for baseline-derived cues and
+        ("n", cue_index) for cues added offline. A merged value of None means
+        the cue is deleted in the merge result.
+        """
+        version_id = int(version["id"])
+        try:
+            baseline_revision = int(payload.get("baseline_revision"))
+        except (TypeError, ValueError) as exc:
+            raise DomainError("基线版本必须是整数修订号") from exc
+        operations = payload.get("operations")
+        if not isinstance(operations, list):
+            raise DomainError("操作日志必须是列表")
+        raw_baseline = payload.get("baseline_cues")
+
+        if isinstance(raw_baseline, list):
+            base: dict[int, dict[str, Any]] = {}
+            for c in raw_baseline:
+                ci = int(c["cue_index"])
+                base[ci] = {"cue_index": ci, "start_ms": int(c["start_ms"]),
+                            "end_ms": int(c["end_ms"]), "text": str(c["text"])}
+        elif baseline_revision == int(version["revision"]):
+            base = {r["cue_index"]: {"cue_index": r["cue_index"], "start_ms": r["start_ms"],
+                                     "end_ms": r["end_ms"], "text": r["text"]}
+                    for r in conn.execute("SELECT cue_index,start_ms,end_ms,text FROM cues WHERE version_id=?", (version_id,))}
+        else:
+            base = {}
+
+        off: dict[Any, Any] = {}
+        for op in operations:
+            if not isinstance(op, dict):
+                raise DomainError("操作日志条目不合法")
+            kind = str(op.get("op", "")).strip()
+            try:
+                ci = int(op.get("ref", op.get("cue_index")))
+            except (TypeError, ValueError) as exc:
+                raise DomainError("操作缺少合法 ref") from exc
+            if kind == "delete":
+                off[("b", ci)] = None
+            elif kind == "add":
+                off[("n", ci)] = self._cue_fields_from_op(op, ci, require_full=True)
+            elif kind == "update":
+                fields = self._cue_fields_from_op(op, ci, require_full=False)
+                prior = base.get(ci)
+                off[("b", ci)] = {**prior, **fields} if prior is not None else fields
+            else:
+                raise DomainError(f"不支持的离线操作类型: {kind}")
+
+        main_rows = conn.execute("SELECT * FROM cues WHERE version_id=?", (version_id,)).fetchall()
+        main_by_idx = {r["cue_index"]: r for r in main_rows}
+
+        merged: dict[Any, Any] = {}
+        conflicts: list[dict[str, Any]] = []
+
+        def field_merge(bv: Any, ov: Any, mv: Any) -> tuple[Any, bool]:
+            if ov == mv:
+                return ov, False
+            if ov == bv:
+                return mv, False
+            if mv == bv:
+                return ov, False
+            return mv, True
+
+        for key in sorted({("b", i) for i in base} | set(off), key=lambda k: (k[0], k[1])):
+            kind, i = key
+            b = base.get(i)
+            o = off.get(key, "MISSING")
+            m = main_by_idx.get(i)
+
+            if kind == "n":
+                if m is None:
+                    merged[key] = o
+                else:
+                    conflicts.append({"id": f"a-{i}", "kind": "add", "cue_index": i,
+                                      "baseline_value": None, "offline_value": o, "main_value": dict(m),
+                                      "merged_value": dict(m), "choices": ["main", "offline"],
+                                      "message": f"字幕 {i} 两侧都新增了同一序号"})
+                    merged[key] = {k: m[k] for k in ("cue_index", "start_ms", "end_ms", "text")}
+                continue
+
+            if o is None:
+                if m is None:
+                    merged[key] = None
+                elif b is not None and self._same_cue(m, b):
+                    merged[key] = None
+                else:
+                    conflicts.append({"id": f"d-{i}", "kind": "delete", "cue_index": i,
+                                      "baseline_value": b, "offline_value": None, "main_value": dict(m),
+                                      "merged_value": dict(m), "choices": ["main", "offline"],
+                                      "message": f"字幕 {i} 一侧删除一侧修改"})
+                    merged[key] = {k: m[k] for k in ("cue_index", "start_ms", "end_ms", "text")}
+                continue
+
+            if o == "MISSING":
+                merged[key] = None if m is None else {k: m[k] for k in ("cue_index", "start_ms", "end_ms", "text")}
+                continue
+
+            if m is None:
+                if b is None:
+                    merged[key] = o
+                else:
+                    conflicts.append({"id": f"d-{i}", "kind": "delete", "cue_index": i,
+                                      "baseline_value": b, "offline_value": o, "main_value": None,
+                                      "merged_value": None, "choices": ["main", "offline"],
+                                      "message": f"字幕 {i} 一侧删除一侧修改"})
+                    merged[key] = None
+                continue
+
+            if b is None:
+                if self._same_cue(m, o):
+                    merged[key] = {k: m[k] for k in ("cue_index", "start_ms", "end_ms", "text")}
+                else:
+                    conflicts.append({"id": f"a-{i}", "kind": "add", "cue_index": i,
+                                      "baseline_value": None, "offline_value": o, "main_value": dict(m),
+                                      "merged_value": dict(m), "choices": ["main", "offline"],
+                                      "message": f"字幕 {i} 两侧都新增了同一序号"})
+                    merged[key] = {k: m[k] for k in ("cue_index", "start_ms", "end_ms", "text")}
+                continue
+
+            final: dict[str, Any] = {}
+            for f in ("cue_index", "start_ms", "end_ms", "text"):
+                value, bad = field_merge(b[f], o[f], m[f])
+                final[f] = value
+                if bad:
+                    conflicts.append({"id": f"f-{i}-{f}", "kind": "field", "cue_index": i, "field": f,
+                                      "baseline_value": b[f], "offline_value": o[f], "main_value": m[f],
+                                      "merged_value": value, "choices": ["main", "offline"],
+                                      "message": f"字幕 {i} 的 {f} 字段两侧修改不一致"})
+            merged[key] = final
+
+        actions: dict[str, list[int]] = {"added": [], "updated": [], "deleted": []}
+        for (kind, i), cue in merged.items():
+            if cue is None:
+                continue
+            if kind == "b":
+                actions["updated" if i in main_by_idx else "added"].append(i)
+            else:
+                actions["updated" if i in main_by_idx else "added"].append(i)
+        for i in base:
+            if merged.get(("b", i)) is None and i in main_by_idx:
+                actions["deleted"].append(i)
+        return merged, conflicts, actions
+
+    def _validate_merged(self, conn: sqlite3.Connection, version: sqlite3.Row,
+                         cues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for g in conn.execute("SELECT * FROM glossaries WHERE project_id=?", (int(version["project_id"]),)):
+            forbidden = json.loads(g["forbidden_terms"])
+            for cue in cues:
+                text = str(cue["text"])
+                for term in forbidden:
+                    if term and term in text:
+                        items.append({"id": f"g-{cue['cue_index']}-{term}", "kind": "glossary",
+                                      "cue_index": cue["cue_index"], "term": term, "choices": ["accept"],
+                                      "message": f"字幕 {cue['cue_index']} 包含禁用译法: {term}"})
+                if g["source_term"] in text and g["required_translation"] not in text:
+                    items.append({"id": f"g-{cue['cue_index']}-{g['source_term']}", "kind": "glossary",
+                                  "cue_index": cue["cue_index"], "term": g["source_term"], "choices": ["accept"],
+                                  "message": f"字幕 {cue['cue_index']} 术语 {g['source_term']} 必须使用指定译法 {g['required_translation']}"})
+        ordered = sorted(cues, key=lambda c: int(c["start_ms"]))
+        for i in range(len(ordered)):
+            for j in range(i + 1, len(ordered)):
+                a, b = ordered[i], ordered[j]
+                if int(a["start_ms"]) < int(b["end_ms"]) and int(b["start_ms"]) < int(a["end_ms"]):
+                    items.append({"id": f"t-{a['cue_index']}-{b['cue_index']}", "kind": "timeline",
+                                  "cue_index": a["cue_index"], "cue_index_b": b["cue_index"], "choices": ["accept"],
+                                  "message": f"字幕 {a['cue_index']} 与 {b['cue_index']} 时间轴交叉"})
+        return items
+
+    def _resolve_merged(self, merged: dict[Any, Any], conflicts: list[dict[str, Any]],
+                        resolutions: dict[str, str]) -> dict[Any, Any]:
+        final = {k: (dict(v) if v is not None else None) for k, v in merged.items()}
+        for c in conflicts:
+            choice = resolutions.get(c["id"])
+            if c["kind"] == "field" and choice == "offline":
+                key = ("b", c["cue_index"])
+                if final.get(key) is not None:
+                    final[key][c["field"]] = c["offline_value"]
+            elif c["kind"] == "delete" and choice == "offline":
+                key = ("b", c["cue_index"])
+                final[key] = dict(c["offline_value"]) if c["offline_value"] is not None else None
+            elif c["kind"] == "add" and choice == "offline":
+                key = ("n", c["cue_index"])
+                final[key] = dict(c["offline_value"])
+        return final
+
+    def _apply_merge(self, conn: sqlite3.Connection, version: sqlite3.Row, final: dict[Any, Any]) -> int:
+        version_id = int(version["id"])
+        base_idx = {i for (k, i) in final if k == "b"}
+        main_rows = conn.execute("SELECT * FROM cues WHERE version_id=?", (version_id,)).fetchall()
+        main_by_idx = {r["cue_index"]: r for r in main_rows}
+
+        before_id_to_ident: dict[int, tuple[str, int]] = {}
+        for r in main_rows:
+            before_id_to_ident[r["id"]] = ("b", r["cue_index"]) if r["cue_index"] in base_idx else ("m", r["cue_index"])
+
+        after_ident_to_id: dict[tuple[str, int], int] = {}
+        for (kind, i), cue in final.items():
+            if cue is None:
+                continue
+            ci = int(cue["cue_index"])
+            if kind in ("b", "n") and i in main_by_idx:
+                row = main_by_idx[i]
+                conn.execute("UPDATE cues SET cue_index=?,start_ms=?,end_ms=?,text=?,updated_by=?,updated_at=? WHERE id=?",
+                             (ci, int(cue["start_ms"]), int(cue["end_ms"]), str(cue["text"]), "offline-batch", utcnow(), row["id"]))
+                after_ident_to_id[(kind, i)] = row["id"]
+            else:
+                cur = conn.execute(
+                    "INSERT INTO cues(version_id,cue_index,start_ms,end_ms,text,updated_by,updated_at) VALUES(?,?,?,?,?,?,?)",
+                    (version_id, ci, int(cue["start_ms"]), int(cue["end_ms"]), str(cue["text"]), "offline-batch", utcnow()))
+                after_ident_to_id[(kind, i)] = cur.lastrowid
+
+        for r in main_rows:
+            ident = ("b", r["cue_index"]) if r["cue_index"] in base_idx else ("m", r["cue_index"])
+            if ident in after_ident_to_id:
+                continue
+            if ident[0] == "m" or final.get(ident) is not None:
+                after_ident_to_id[ident] = r["id"]
+
+        for (kind, i), cue in final.items():
+            if kind == "b" and cue is None and i in main_by_idx:
+                conn.execute("DELETE FROM cues WHERE id=?", (main_by_idx[i]["id"],))
+
+        for c in conn.execute("SELECT * FROM comments WHERE version_id=?", (version_id,)).fetchall():
+            if c["cue_id"] is None:
+                continue
+            ident = before_id_to_ident.get(c["cue_id"])
+            new_id = after_ident_to_id.get(ident) if ident is not None else None
+            if new_id != c["cue_id"]:
+                conn.execute("UPDATE comments SET cue_id=? WHERE id=?", (new_id, c["id"]))
+
+        revision = int(version["revision"]) + 1
+        conn.execute("UPDATE versions SET revision=?,updated_at=? WHERE id=?", (revision, utcnow(), version_id))
+
+        delivery = conn.execute("SELECT * FROM deliveries WHERE version_id=?", (version_id,)).fetchone()
+        if delivery:
+            cues = [dict(r) for r in conn.execute("SELECT cue_index,start_ms,end_ms,text FROM cues WHERE version_id=? ORDER BY cue_index", (version_id,))]
+            glossary = [dict(r) for r in conn.execute("SELECT source_term,required_translation,forbidden_terms FROM glossaries WHERE project_id=? ORDER BY source_term", (int(version["project_id"]),))]
+            manifest = {"project_id": int(version["project_id"]), "version_id": version_id, "language": version["language"],
+                        "version_no": version["version_no"], "cues": cues, "glossary": glossary}
+            snapshot_hash = hashlib.sha256(json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            conn.execute("UPDATE deliveries SET snapshot_hash=?,manifest=? WHERE id=?",
+                         (snapshot_hash, json.dumps(manifest, ensure_ascii=False, sort_keys=True), delivery["id"]))
+        return revision
+
+    def upload_batch(self, version_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise DomainError("批次内容不合法")
+        try:
+            int(payload.get("baseline_revision"))
+        except (TypeError, ValueError) as exc:
+            raise DomainError("基线版本必须是整数修订号") from exc
+        if not isinstance(payload.get("operations"), list):
+            raise DomainError("操作日志必须是列表")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            version = self._version(conn, version_id)
+            self._check_upload_batch(conn, version, actor, role)
+            content_hash = self._batch_hash(version_id, payload)
+            existing = conn.execute("SELECT * FROM offline_batches WHERE version_id=? AND content_hash=?",
+                                    (version_id, content_hash)).fetchone()
+            if existing and existing["status"] in ("confirmed", "pending"):
+                return dict(existing)
+            if existing:
+                batch_id = existing["id"]
+            else:
+                cur = conn.execute(
+                    """INSERT INTO offline_batches(version_id,baseline_revision,status,content_hash,payload,merge_result,uploaded_by,created_at)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (version_id, int(payload["baseline_revision"]), "pending", content_hash,
+                     json.dumps(payload, ensure_ascii=False), "{}", actor, utcnow()))
+                batch_id = cur.lastrowid
+            try:
+                merged, conflicts, actions = self._compute_merge(conn, version, payload)
+                final_cues = [v for v in merged.values() if v is not None]
+                val_items = self._validate_merged(conn, version, final_cues)
+                result = {"merged": final_cues, "conflicts": conflicts + val_items, "actions": actions}
+            except DomainError as exc:
+                conn.execute("UPDATE offline_batches SET status='failed',error=? WHERE id=?", (str(exc), batch_id))
+                raise
+            except Exception as exc:
+                conn.execute("UPDATE offline_batches SET status='failed',error=? WHERE id=?", (str(exc), batch_id))
+                raise DomainError(f"批次导入失败，可重试: {exc}", 409) from exc
+            conn.execute("UPDATE offline_batches SET merge_result=?,error='',status='pending' WHERE id=?",
+                         (json.dumps(result, ensure_ascii=False), batch_id))
+            self._audit(conn, actor, "batch.uploaded", "version", version_id,
+                        {"batch_id": batch_id, "conflicts": len(result["conflicts"])})
+        return dict(conn.execute("SELECT * FROM offline_batches WHERE id=?", (batch_id,)).fetchone())
+
+    def list_batches(self, version_id: int, actor: str, role: str = "viewer") -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            version = self._version(conn, version_id)
+            self._check_batch_access(conn, version, actor, role)
+            return [dict(r) for r in conn.execute("SELECT * FROM offline_batches WHERE version_id=? ORDER BY id DESC", (version_id,))]
+
+    def get_batch(self, batch_id: int, actor: str, role: str = "viewer") -> dict[str, Any]:
+        with self.connect() as conn:
+            batch = conn.execute("SELECT * FROM offline_batches WHERE id=?", (batch_id,)).fetchone()
+            if not batch:
+                raise DomainError("离线批次不存在", 404)
+            version = self._version(conn, batch["version_id"])
+            self._check_batch_access(conn, version, actor, role)
+            return dict(batch)
+
+    def retry_batch(self, batch_id: int, actor: str, role: str = "viewer") -> dict[str, Any]:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            batch = conn.execute("SELECT * FROM offline_batches WHERE id=?", (batch_id,)).fetchone()
+            if not batch:
+                raise DomainError("离线批次不存在", 404)
+            version = self._version(conn, batch["version_id"])
+            self._check_upload_batch(conn, version, actor, role)
+            if batch["status"] != "failed":
+                raise DomainError(f"批次状态为 {batch['status']}，无需重试", 409)
+            payload = json.loads(batch["payload"])
+            try:
+                merged, conflicts, actions = self._compute_merge(conn, version, payload)
+                final_cues = [v for v in merged.values() if v is not None]
+                val_items = self._validate_merged(conn, version, final_cues)
+                result = {"merged": final_cues, "conflicts": conflicts + val_items, "actions": actions}
+            except DomainError:
+                raise
+            except Exception as exc:
+                conn.execute("UPDATE offline_batches SET error=? WHERE id=?", (str(exc), batch_id))
+                raise DomainError(f"批次导入失败，可重试: {exc}", 409) from exc
+            conn.execute("UPDATE offline_batches SET status='pending',merge_result=?,error='',uploaded_by=?,created_at=? WHERE id=?",
+                         (json.dumps(result, ensure_ascii=False), actor, utcnow(), batch_id))
+            self._audit(conn, actor, "batch.retried", "version", version["id"], {"batch_id": batch_id})
+        return dict(conn.execute("SELECT * FROM offline_batches WHERE id=?", (batch_id,)).fetchone())
+
+    def confirm_batch(self, batch_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
+        resolutions: dict[str, str] = {}
+        if isinstance(payload, dict):
+            raw = payload.get("resolutions")
+            if isinstance(raw, dict):
+                resolutions = {str(k): str(v) for k, v in raw.items()}
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            batch = conn.execute("SELECT * FROM offline_batches WHERE id=?", (batch_id,)).fetchone()
+            if not batch:
+                raise DomainError("离线批次不存在", 404)
+            version = self._version(conn, batch["version_id"])
+            self._check_batch_access(conn, version, actor, role, require_owner=True)
+            if batch["status"] == "confirmed":
+                return dict(batch)
+            if batch["status"] != "pending":
+                raise DomainError(f"批次状态为 {batch['status']}，不能确认；失败批次请先重试", 409)
+            body = json.loads(batch["payload"])
+            merged, conflicts, actions = self._compute_merge(conn, version, body)
+            final_cues = [v for v in merged.values() if v is not None]
+            val_items = self._validate_merged(conn, version, final_cues)
+            all_conflicts = conflicts + val_items
+            final = self._resolve_merged(merged, all_conflicts, resolutions)
+            revision = self._apply_merge(conn, version, final)
+            result = {"merged": [v for v in final.values() if v is not None], "conflicts": all_conflicts, "actions": actions}
+            conn.execute("UPDATE offline_batches SET status='confirmed',confirmed_by=?,confirmed_at=?,merge_result=? WHERE id=?",
+                         (actor, utcnow(), json.dumps(result, ensure_ascii=False), batch_id))
+            self._audit(conn, actor, "batch.confirmed", "version", version["id"],
+                        {"batch_id": batch_id, "revision": revision, "conflicts": len(all_conflicts)})
+        return dict(conn.execute("SELECT * FROM offline_batches WHERE id=?", (batch_id,)).fetchone())
+
     def list_projects(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
             return [dict(r) for r in conn.execute("SELECT * FROM projects ORDER BY id").fetchall()]
@@ -456,6 +886,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         try:
+            actor, role = self._auth()
             if parsed.path in {"/", "/index.html"}:
                 return self._html()
             if parsed.path == "/api/health":
@@ -473,6 +904,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send({"cues": self.db.list_cues(int(parts[2]))})
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "comments":
                 return self._send({"comments": self.db.list_comments(int(parts[2]))})
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "offline-batches":
+                return self._send({"batches": self.db.list_batches(int(parts[2]), actor, role)})
+            if len(parts) == 3 and parts[:2] == ["api", "offline-batches"]:
+                return self._send(self.db.get_batch(int(parts[2]), actor, role))
             raise DomainError("接口不存在", 404)
         except (ValueError, DomainError) as exc:
             self._send({"error": str(exc)}, getattr(exc, "status", 400))
@@ -504,6 +939,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(self.db.deliver(version_id, actor, role))
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "review":
                 return self._send(self.db.review(int(parts[2]), actor, body, role))
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "offline-batches":
+                return self._send(self.db.upload_batch(int(parts[2]), actor, body, role), 201)
+            if len(parts) == 4 and parts[:2] == ["api", "offline-batches"] and parts[3] in {"confirm", "retry"}:
+                if parts[3] == "confirm":
+                    return self._send(self.db.confirm_batch(int(parts[2]), actor, body, role))
+                return self._send(self.db.retry_batch(int(parts[2]), actor, role))
             raise DomainError("接口不存在", 404)
         except (ValueError, TypeError, DomainError) as exc:
             self._send({"error": str(exc)}, getattr(exc, "status", 400))
